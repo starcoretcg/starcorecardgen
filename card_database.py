@@ -146,10 +146,3 @@ cat >> requirements.txt << 'EOF'
 psycopg2-binary
 sqlalchemy
 EOF
-
-# Push everything
-git add card_database.py requirements.txt
-git commit -m "Add database helper module"
-git push origin maingit add card_database.py requirements.txt
-git commit -m "Add database helper module"
-git push origin main
