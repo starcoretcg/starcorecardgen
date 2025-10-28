@@ -1,20 +1,29 @@
 """
 StarCore Resource Core Generator - Streamlit Page
 Two-column layout with featured card, data table, and statistics
+WITH DATABASE PERSISTENCE
 """
 
 import streamlit as st
 import pandas as pd
 from resource_core_generator import generate_resource_core, calculate_weight
+from card_database import init_database, save_card, load_recent_cards, get_card_stats, clear_all_cards
 
 st.title("⚡ Resource Core Generator")
 
-# Initialize session state
-if 'generated_cards' not in st.session_state:
-    st.session_state.generated_cards = []
+# Initialize database on first load
+if 'db_initialized' not in st.session_state:
+    init_database()
+    st.session_state.db_initialized = True
 
-# Two-column layout
-left_col, right_col = st.columns([1, 2])
+# Load cards from database
+if 'cards_loaded' not in st.session_state:
+    db_cards = load_recent_cards(limit=100)
+    st.session_state.generated_cards = db_cards
+    st.session_state.cards_loaded = True
+
+# Two-column layout - STRICT SEPARATION
+left_col, right_col = st.columns([1, 2], gap="large")
 
 # ============ LEFT COLUMN: GENERATOR ============
 with left_col:
@@ -33,51 +42,48 @@ with left_col:
     
     # Generate button
     if st.button("🎲 Generate Resource Core", type="primary", use_container_width=True):
-        # Generate cores until we get the right size (if not Random)
-        if core_size == "Random":
-            core = generate_resource_core(resource_type)
-        else:
-            # Keep generating until we get the requested size
-            max_attempts = 100
-            for _ in range(max_attempts):
-                core = generate_resource_core(resource_type)
-                if core.size == core_size:
-                    break
+        # Generate the core
+        core = generate_resource_core(resource_type)
         
-        st.session_state.generated_cards.insert(0, core)
+        # If specific size requested, keep trying (max 100 attempts)
+        if core_size != "Random":
+            attempts = 0
+            while core.size != core_size and attempts < 100:
+                core = generate_resource_core(resource_type)
+                attempts += 1
+        
+        # Save to database
+        if save_card(core, card_type="Resource Core"):
+            st.session_state.generated_cards.insert(0, core)
+            st.success("✅ Card saved!")
+        else:
+            # Fallback to session only if DB fails
+            st.session_state.generated_cards.insert(0, core)
+            st.warning("⚠️ Session only (DB unavailable)")
     
-    # Most recent card display
+    # Most recent card display (stays in left column)
     if st.session_state.generated_cards:
         st.markdown("---")
         st.subheader("🎴 Most Recent")
         
         core = st.session_state.generated_cards[0]
-        
-        rarity_emojis = {
-            "Common": "⚪",
-            "Uncommon": "🔵",
-            "Rare": "🔵",
-            "Epic": "🟣",
-            "Legendary": "🟡"
-        }
-        
-        emoji = rarity_emojis.get(core.rarity, "")
         score = (core.quality * 0.7) + (core.tier * 3)
         
-        # Card display
-        st.markdown(f"### {emoji} {core.size} {core.resource_type} Core")
+        # Card display - NO EMOJIS, USE RARITY TEXT
+        st.markdown(f"### {core.size} {core.resource_type} Core")
         st.code(f"ID: {core.card_id}", language=None)
-        st.caption(f"{core.rarity} | T{core.tier} Q{core.quality} | Score: {score:.1f}")
+        st.caption(f"**{core.rarity}** | T{core.tier} Q{core.quality} | Score: {score:.1f}")
         
-        # Stats table
-        stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
-        with stat_col1:
+        # Stats in a grid
+        st.markdown("**Stats:**")
+        stat_cols = st.columns(4)
+        with stat_cols[0]:
             st.metric("Cost", core.cost)
-        with stat_col2:
+        with stat_cols[1]:
             st.metric("RPT", core.rpt)
-        with stat_col3:
+        with stat_cols[2]:
             st.metric("HP", core.hp)
-        with stat_col4:
+        with stat_cols[3]:
             st.metric("Links", core.links)
 
 # ============ RIGHT COLUMN: DATA TABLE ============
@@ -85,22 +91,13 @@ with right_col:
     st.subheader(f"📊 Generation History ({len(st.session_state.generated_cards)} cards)")
     
     if st.session_state.generated_cards:
-        # Build dataframe
-        rarity_emojis = {
-            "Common": "⚪",
-            "Uncommon": "🔵",
-            "Rare": "🔵",
-            "Epic": "🟣",
-            "Legendary": "🟡"
-        }
-        
+        # Build dataframe - NO EMOJIS
         data = []
         for core in st.session_state.generated_cards:
-            emoji = rarity_emojis.get(core.rarity, "")
             score = (core.quality * 0.7) + (core.tier * 3)
             
             data.append({
-                "Rarity": f"{emoji} {core.rarity[:3]}",
+                "Rarity": core.rarity,  # NO EMOJI
                 "Size": core.size,
                 "Type": core.resource_type,
                 "ID": core.card_id[:8],
@@ -125,9 +122,10 @@ with right_col:
     else:
         st.info("👆 Generate your first card to see the data table!")
 
-# ============ STATISTICS SECTION (FULL WIDTH) ============
+# ============ STATISTICS SECTION (FULL WIDTH BELOW COLUMNS) ============
+st.markdown("---")
+
 if st.session_state.generated_cards:
-    st.markdown("---")
     st.header("📈 Generation Statistics")
     
     # Summary metrics
@@ -161,8 +159,12 @@ if st.session_state.generated_cards:
         )
     with btn_col2:
         if st.button("🗑️ Clear History", use_container_width=True):
-            st.session_state.generated_cards = []
-            st.rerun()
+            if clear_all_cards(card_type="Resource Core"):
+                st.session_state.generated_cards = []
+                st.success("✅ Database cleared!")
+                st.rerun()
+            else:
+                st.error("❌ Failed to clear database")
     with btn_col3:
         st.button("🎲 Batch Generate (Coming Soon)", disabled=True, use_container_width=True)
     
