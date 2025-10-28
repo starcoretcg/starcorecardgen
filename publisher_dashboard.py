@@ -1,22 +1,25 @@
 """
 StarCore TCG - Publisher Dashboard
-Unified publishing workflow for all card types
+Unified publishing workflow using database backend
 """
 
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-from card_state_manager import CardStateManager, CardState
+from card_database import (
+    init_database, get_cards_by_state, get_state_stats,
+    update_card_state, bulk_update_states, can_transition
+)
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from card_database import GeneratedCard, get_db_engine
 
-# Page config
 st.set_page_config(page_title="Publisher Dashboard", page_icon="📋", layout="wide")
 
-# Initialize state manager
-@st.cache_resource
-def get_state_manager():
-    return CardStateManager(data_dir="data")
-
-manager = get_state_manager()
+# Initialize database
+if 'db_initialized' not in st.session_state:
+    init_database()
+    st.session_state.db_initialized = True
 
 # Header
 st.title("📋 Publisher Dashboard")
@@ -26,7 +29,7 @@ st.markdown("Manage card publishing workflow across all card types")
 st.markdown("---")
 col1, col2, col3, col4 = st.columns(4)
 
-stats = manager.get_stats()
+stats = get_state_stats()
 with col1:
     st.metric("📦 Total Cards", stats["total"])
 with col2:
@@ -50,9 +53,8 @@ with filter_col1:
     )
 
 with filter_col2:
-    # Get unique card types
-    all_cards = manager.get_all_cards()
-    card_types = list(set([card.card_type for card in all_cards])) if all_cards else []
+    # Get unique card types from stats
+    card_types = list(stats["by_type"].keys()) if stats["by_type"] else []
     type_filter = st.multiselect(
         "Card Type",
         card_types,
@@ -62,19 +64,31 @@ with filter_col2:
 with filter_col3:
     search_id = st.text_input("Search Card ID", placeholder="Enter hash ID...")
 
-# Get filtered cards
-filtered_cards = manager.get_all_cards()
-
-# Apply filters
-if state_filter:
-    filtered_cards = [c for c in filtered_cards if c.state in state_filter]
-if type_filter:
-    filtered_cards = [c for c in filtered_cards if c.card_type in type_filter]
-if search_id:
-    filtered_cards = [c for c in filtered_cards if search_id.lower() in c.card_id.lower()]
-
-# Sort by created date (newest first)
-filtered_cards.sort(key=lambda x: x.created_at, reverse=True)
+# Get filtered cards from database
+try:
+    engine = get_db_engine()
+    if engine:
+        Session = sessionmaker(bind=engine)
+        session = Session()
+        
+        # Build query
+        query = session.query(GeneratedCard)
+        
+        if state_filter:
+            query = query.filter(GeneratedCard.state.in_(state_filter))
+        
+        if type_filter:
+            query = query.filter(GeneratedCard.card_type.in_(type_filter))
+        
+        if search_id:
+            query = query.filter(GeneratedCard.card_id.contains(search_id))
+        
+        filtered_cards = query.order_by(GeneratedCard.created_at.desc()).all()
+        session.close()
+    else:
+        filtered_cards = []
+except:
+    filtered_cards = []
 
 # Display cards
 st.markdown("---")
@@ -95,19 +109,23 @@ else:
         
         # Card type emoji
         type_emoji = {
-            "resource_core": "⚡",
-            "commander": "👑",
-            "unit": "🎖️"
+            "Resource Core": "⚡",
+            "Commander": "👑",
+            "Unit": "🎖️"
         }
         
         card_data.append({
             "State": f"{state_emoji.get(card.state, '')} {card.state.title()}",
-            "Type": f"{type_emoji.get(card.card_type, '📦')} {card.card_type.replace('_', ' ').title()}",
+            "Type": f"{type_emoji.get(card.card_type, '📦')} {card.card_type}",
             "Card ID": card.card_id,
-            "Created": datetime.fromisoformat(card.created_at).strftime("%Y-%m-%d %H:%M"),
-            "Published": datetime.fromisoformat(card.published_at).strftime("%Y-%m-%d %H:%M") if card.published_at else "-",
-            "Version": card.version,
-            "Notes": card.notes[:50] + "..." if len(card.notes) > 50 else card.notes
+            "Size": card.size,
+            "Resource": card.resource_type,
+            "Rarity": card.rarity,
+            "Tier": card.tier,
+            "Quality": card.quality,
+            "Score": round(card.score, 1),
+            "Created": card.created_at.strftime("%Y-%m-%d %H:%M") if card.created_at else "-",
+            "Published": card.published_at.strftime("%Y-%m-%d %H:%M") if card.published_at else "-",
         })
     
     # Display table
@@ -129,19 +147,17 @@ else:
         st.markdown("**Promote All Drafts**")
         draft_cards = [c for c in filtered_cards if c.state == "draft"]
         if st.button(f"📤 Publish {len(draft_cards)} Drafts", disabled=len(draft_cards) == 0):
-            results = manager.bulk_transition([c.card_id for c in draft_cards], "published")
-            success_count = sum(1 for v in results.values() if v)
-            st.success(f"✅ Published {success_count} cards!")
-            st.rerun()
+            if bulk_update_states([c.card_id for c in draft_cards], "published"):
+                st.success(f"✅ Published {len(draft_cards)} cards!")
+                st.rerun()
     
     with bulk_col2:
         st.markdown("**Archive Published**")
         published_cards = [c for c in filtered_cards if c.state == "published"]
         if st.button(f"🗄️ Archive {len(published_cards)} Published", disabled=len(published_cards) == 0):
-            results = manager.bulk_transition([c.card_id for c in published_cards], "archived")
-            success_count = sum(1 for v in results.values() if v)
-            st.success(f"✅ Archived {success_count} cards!")
-            st.rerun()
+            if bulk_update_states([c.card_id for c in published_cards], "archived"):
+                st.success(f"✅ Archived {len(published_cards)} cards!")
+                st.rerun()
     
     with bulk_col3:
         st.markdown("**Export Data**")
@@ -168,65 +184,56 @@ with manage_col1:
     ) if filtered_cards else None
 
 if selected_card_id:
-    selected_card = manager.get_card_state(selected_card_id)
+    selected_card = next((c for c in filtered_cards if c.card_id == selected_card_id), None)
     
-    with manage_col2:
-        st.markdown("**Current State**")
-        state_emoji = {"draft": "📝", "published": "✅", "archived": "🗄️"}
-        st.markdown(f"### {state_emoji.get(selected_card.state, '')} {selected_card.state.title()}")
-    
-    # Show card details
-    detail_col1, detail_col2 = st.columns(2)
-    
-    with detail_col1:
-        st.markdown("**Card Information**")
-        st.text(f"ID: {selected_card.card_id}")
-        st.text(f"Type: {selected_card.card_type.replace('_', ' ').title()}")
-        st.text(f"Version: {selected_card.version}")
-        st.text(f"Created: {datetime.fromisoformat(selected_card.created_at).strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    with detail_col2:
-        st.markdown("**Timeline**")
-        if selected_card.published_at:
-            st.text(f"✅ Published: {datetime.fromisoformat(selected_card.published_at).strftime('%Y-%m-%d %H:%M:%S')}")
-        if selected_card.archived_at:
-            st.text(f"🗄️ Archived: {datetime.fromisoformat(selected_card.archived_at).strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    if selected_card.notes:
-        st.markdown("**Notes**")
-        st.text_area("", value=selected_card.notes, height=100, disabled=True)
-    
-    # State transition buttons
-    st.markdown("**Available Actions**")
-    action_col1, action_col2, action_col3 = st.columns(3)
-    
-    with action_col1:
-        if manager.can_transition(selected_card_id, "published"):
-            if st.button("📤 Promote to Published", use_container_width=True):
-                if manager.transition_state(selected_card_id, "published"):
-                    st.success("✅ Card published!")
-                    st.rerun()
-                else:
-                    st.error("❌ Failed to publish card")
-    
-    with action_col2:
-        if manager.can_transition(selected_card_id, "archived"):
-            if st.button("🗄️ Archive Card", use_container_width=True):
-                if manager.transition_state(selected_card_id, "archived"):
-                    st.success("✅ Card archived!")
-                    st.rerun()
-                else:
-                    st.error("❌ Failed to archive card")
-    
-    with action_col3:
-        if st.button("🗑️ Delete State", use_container_width=True, type="secondary"):
-            if st.session_state.get(f"confirm_delete_{selected_card_id}"):
-                manager.delete_card_state(selected_card_id)
-                st.success("✅ Card state deleted!")
-                st.rerun()
-            else:
-                st.session_state[f"confirm_delete_{selected_card_id}"] = True
-                st.warning("⚠️ Click again to confirm deletion")
+    if selected_card:
+        with manage_col2:
+            st.markdown("**Current State**")
+            state_emoji = {"draft": "📝", "published": "✅", "archived": "🗄️"}
+            st.markdown(f"### {state_emoji.get(selected_card.state, '')} {selected_card.state.title()}")
+        
+        # Show card details
+        detail_col1, detail_col2, detail_col3 = st.columns(3)
+        
+        with detail_col1:
+            st.markdown("**Card Information**")
+            st.text(f"ID: {selected_card.card_id}")
+            st.text(f"Type: {selected_card.card_type}")
+            st.text(f"Size: {selected_card.size}")
+            st.text(f"Resource: {selected_card.resource_type}")
+        
+        with detail_col2:
+            st.markdown("**Stats**")
+            st.text(f"Rarity: {selected_card.rarity}")
+            st.text(f"Tier: {selected_card.tier}")
+            st.text(f"Quality: {selected_card.quality}")
+            st.text(f"Score: {selected_card.score:.1f}")
+        
+        with detail_col3:
+            st.markdown("**Timeline**")
+            st.text(f"Created: {selected_card.created_at.strftime('%Y-%m-%d %H:%M')}" if selected_card.created_at else "Created: -")
+            if selected_card.published_at:
+                st.text(f"✅ Published: {selected_card.published_at.strftime('%Y-%m-%d %H:%M')}")
+            if selected_card.archived_at:
+                st.text(f"🗄️ Archived: {selected_card.archived_at.strftime('%Y-%m-%d %H:%M')}")
+        
+        # State transition buttons
+        st.markdown("**Available Actions**")
+        action_col1, action_col2, action_col3 = st.columns(3)
+        
+        with action_col1:
+            if can_transition(selected_card_id, "published"):
+                if st.button("📤 Promote to Published", use_container_width=True):
+                    if update_card_state(selected_card_id, "published"):
+                        st.success("✅ Card published!")
+                        st.rerun()
+        
+        with action_col2:
+            if can_transition(selected_card_id, "archived"):
+                if st.button("🗄️ Archive Card", use_container_width=True):
+                    if update_card_state(selected_card_id, "archived"):
+                        st.success("✅ Card archived!")
+                        st.rerun()
 
 # Workflow Reference
 with st.expander("ℹ️ Publishing Workflow Reference"):
@@ -255,5 +262,4 @@ with st.expander("ℹ️ Publishing Workflow Reference"):
 # Debug info (collapsible)
 with st.expander("🔧 Debug Info"):
     st.json(stats)
-    st.text(f"State file: {manager.state_file}")
-    st.text(f"Total states loaded: {len(manager.states)}")
+    st.text(f"Total states: {stats['total']}")

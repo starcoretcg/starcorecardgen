@@ -1,13 +1,15 @@
 """
 StarCore Resource Core Generator - Streamlit Page
-Single-column scrolling layout with search/filter
-WITH DATABASE PERSISTENCE
+WITH DATABASE PERSISTENCE AND STATE MANAGEMENT
 """
 
 import streamlit as st
 import pandas as pd
 from resource_core_generator import generate_resource_core, calculate_weight
-from card_database import init_database, save_card, load_recent_cards, clear_all_cards
+from card_database import (
+    init_database, save_card, load_recent_cards, clear_all_cards,
+    update_card_state, can_transition
+)
 
 st.title("⚡ Resource Core Generator")
 
@@ -45,9 +47,10 @@ with gen_col3:
                 core = generate_resource_core(resource_type)
                 attempts += 1
         
-        if save_card(core, card_type="Resource Core"):
+        # Save with draft state
+        if save_card(core, card_type="Resource Core", state="draft", notes="Auto-generated"):
             st.session_state.generated_cards.insert(0, core)
-            st.success("✅ Card saved!")
+            st.success("✅ Card saved as Draft!")
             st.rerun()
 
 # Most recent card display
@@ -57,6 +60,15 @@ if st.session_state.generated_cards:
     
     core = st.session_state.generated_cards[0]
     score = (core.quality * 0.7) + (core.tier * 3)
+    
+    # State badge
+    state_emoji = {
+        "draft": "📝",
+        "published": "✅",
+        "archived": "🗄️"
+    }
+    state = getattr(core, 'state', 'draft')
+    st.markdown(f"### {state_emoji.get(state, '📝')} {state.upper()}")
     
     recent_col1, recent_col2, recent_col3, recent_col4 = st.columns(4)
     
@@ -77,24 +89,55 @@ if st.session_state.generated_cards:
         st.metric("RPT", core.rpt)
     
     st.code(f"ID: {core.card_id}", language=None)
+    
+    # State transition buttons
+    st.markdown("---")
+    btn_col1, btn_col2, btn_col3 = st.columns(3)
+    
+    with btn_col1:
+        if state == "draft" and can_transition(core.card_id, "published"):
+            if st.button("📤 Promote to Published", use_container_width=True, type="primary"):
+                if update_card_state(core.card_id, "published"):
+                    st.success("✅ Card published!")
+                    st.rerun()
+    
+    with btn_col2:
+        if state == "published" and can_transition(core.card_id, "archived"):
+            if st.button("🗄️ Archive Card", use_container_width=True):
+                if update_card_state(core.card_id, "archived"):
+                    st.success("✅ Card archived!")
+                    st.rerun()
+    
+    with btn_col3:
+        if state == "draft" and can_transition(core.card_id, "archived"):
+            if st.button("🗑️ Skip to Archived", use_container_width=True):
+                if update_card_state(core.card_id, "archived"):
+                    st.success("✅ Card archived!")
+                    st.rerun()
 
 # ============ SEARCH/FILTER SECTION ============
 st.markdown("---")
 st.header("🔍 Card History")
 
-filter_col1, filter_col2, filter_col3 = st.columns(3)
+filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
 
 with filter_col1:
-    search_rarity = st.multiselect("Filter by Rarity", ["Common", "Uncommon", "Rare", "Epic", "Legendary"])
+    search_state = st.multiselect("Filter by State", ["draft", "published", "archived"])
 
 with filter_col2:
-    search_size = st.multiselect("Filter by Size", ["Small", "Medium", "Large", "Massive"])
+    search_rarity = st.multiselect("Filter by Rarity", ["Common", "Uncommon", "Rare", "Epic", "Legendary"])
 
 with filter_col3:
+    search_size = st.multiselect("Filter by Size", ["Small", "Medium", "Large", "Massive"])
+
+with filter_col4:
     search_type = st.multiselect("Filter by Type", ["Energy", "Matter", "Signal", "Life", "Omni"])
 
 # Apply filters
 filtered_cards = st.session_state.generated_cards
+
+if search_state:
+    filtered_cards = [c for c in filtered_cards if getattr(c, 'state', 'draft') in search_state]
 
 if search_rarity:
     filtered_cards = [c for c in filtered_cards if c.rarity in search_rarity]
@@ -112,7 +155,11 @@ if filtered_cards:
     data = []
     for core in filtered_cards:
         score = (core.quality * 0.7) + (core.tier * 3)
+        state = getattr(core, 'state', 'draft')
+        state_emoji = {"draft": "📝", "published": "✅", "archived": "🗄️"}
+        
         data.append({
+            "State": f"{state_emoji.get(state, '📝')}",
             "Rarity": core.rarity,
             "Size": core.size,
             "Type": core.resource_type,
@@ -158,15 +205,22 @@ if st.session_state.generated_cards:
     epic_plus = len([c for c in st.session_state.generated_cards if c.rarity in ["Epic", "Legendary"]])
     epic_rate = (epic_plus / total) * 100
     
-    stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
+    # Add state counts
+    draft_count = len([c for c in st.session_state.generated_cards if getattr(c, 'state', 'draft') == 'draft'])
+    published_count = len([c for c in st.session_state.generated_cards if getattr(c, 'state', 'draft') == 'published'])
+    archived_count = len([c for c in st.session_state.generated_cards if getattr(c, 'state', 'draft') == 'archived'])
+    
+    stat_col1, stat_col2, stat_col3, stat_col4, stat_col5 = st.columns(5)
     
     with stat_col1:
         st.metric("Total Cards", total)
     with stat_col2:
-        st.metric("Avg Quality", f"{avg_quality:.1f}")
+        st.metric("📝 Drafts", draft_count)
     with stat_col3:
-        st.metric("Avg Tier", f"{avg_tier:.1f}")
+        st.metric("✅ Published", published_count)
     with stat_col4:
+        st.metric("🗄️ Archived", archived_count)
+    with stat_col5:
         st.metric("Epic+ Rate", f"{epic_rate:.1f}%")
     
     # Distribution charts
